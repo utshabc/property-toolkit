@@ -6,7 +6,13 @@ import json
 import datetime
 import os
 
-client = anthropic.Anthropic()
+def get_api_key():
+    try:
+        return st.secrets["ANTHROPIC_API_KEY"]
+    except Exception:
+        return os.environ.get("ANTHROPIC_API_KEY")
+
+client = anthropic.Anthropic(api_key=get_api_key())
 
 with open("checklist.md", "r") as f:
     checklist_text = f.read()
