@@ -1,0 +1,6 @@
+usage.json
+.DS_Store
+__pycache__/
+*.pyc
+.streamlit/secrets.toml
+app.py.save
