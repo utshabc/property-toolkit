@@ -5,6 +5,8 @@ import base64
 import json
 import datetime
 import os
+import io
+from PIL import Image
 
 def get_api_key():
     try:
@@ -53,6 +55,18 @@ st.title("🏠 Building & Pest Report Reviewer")
 st.caption("Upload a building & pest inspection report to get a plain-language summary.")
 st.caption(f"Daily usage: {get_usage_today()}/{DAILY_LIMIT} reviews used today")
 
+with st.expander("📋 Your property context (optional)"):
+    st.caption(
+        "Property age, construction type, and roof details are read directly from your "
+        "report — no need to enter them. Just add the price if you want a verdict and "
+        "dollar-tier prioritization."
+    )
+    price = st.text_input("Asking/contract price", placeholder="e.g. $650,000")
+    plan = st.selectbox(
+        "Your plan for this property",
+        ["", "Long-term rental", "Renovate", "Land value / knock-down", "Owner-occupy"]
+    )
+
 uploaded_file = st.file_uploader("Upload your report (PDF)", type=["pdf"])
 
 consent = st.checkbox(
@@ -98,6 +112,13 @@ SEVERITY_STYLE = {
     "gap": ("#6B7280", "❔ Needs follow-up"),
 }
 
+VERDICT_STYLE = {
+    "proceed as is": ("#2E7D32", "✅ Proceed as is"),
+    "proceed with negotiation": ("#F5B301", "🤝 Proceed with negotiation"),
+    "specialist follow-up before deciding": ("#3B82F6", "🔍 Specialist follow-up before deciding"),
+    "walk away": ("#E4002B", "🚫 Walk away"),
+}
+
 def severity_badge(severity):
     color, label = SEVERITY_STYLE.get(severity, ("#6B7280", severity.title()))
     return (
@@ -105,15 +126,49 @@ def severity_badge(severity):
         f'border-radius:999px;font-size:0.85em;font-weight:600;">{label}</span>'
     )
 
-def build_markdown_report(data):
+def build_markdown_report(data, image_registry):
     lines = ["# Building & Pest Report Review", ""]
     if data.get("report_type_note"):
         lines += [f"> {data['report_type_note']}", ""]
 
+    extracted = data.get("extracted_property_details")
+    if extracted and any(extracted.values()):
+        lines += ["## Property Details (extracted from report)", ""]
+        if extracted.get("age_year_built"):
+            lines.append(f"- **Built:** {extracted['age_year_built']}")
+        if extracted.get("construction_type"):
+            lines.append(f"- **Construction:** {extracted['construction_type']}")
+        if extracted.get("roof_type"):
+            lines.append(f"- **Roof:** {extracted['roof_type']}")
+        if extracted.get("foundation_type"):
+            lines.append(f"- **Foundation:** {extracted['foundation_type']}")
+        lines.append("")
+
+    verdict = data.get("verdict")
+    if verdict:
+        lines += [
+            "## Verdict",
+            f"**{verdict.get('recommendation', '').title()}**",
+            verdict.get("reasoning", ""),
+        ]
+        if verdict.get("negotiation_amount"):
+            lines.append(f"Suggested negotiation figure: {verdict['negotiation_amount']}")
+        lines.append("")
+
     lines += ["## Top 3 Priority Actions", ""]
-    for i, action in enumerate(data.get("top_3_actions", []), start=1):
+    for i, item in enumerate(data.get("top_3_actions", []), start=1):
+        action = item.get("action") if isinstance(item, dict) else item
+        script = item.get("script") if isinstance(item, dict) else None
         lines.append(f"{i}. {action}")
+        if script:
+            lines.append(f"   - 💬 Say this: \"{script}\"")
     lines.append("")
+
+    if data.get("inspector_questions"):
+        lines += ["## Questions to Ask Your Inspector", ""]
+        for q in data["inspector_questions"]:
+            lines.append(f"- {q}")
+        lines.append("")
 
     counts = {}
     for f in data["findings"]:
@@ -126,13 +181,25 @@ def build_markdown_report(data):
     lines += ["## Full Findings List", ""]
     for f in data["findings"]:
         label = SEVERITY_STYLE.get(f["severity"], (None, f["severity"]))[1]
-        lines.append(f"### {label}")
+        tier_tag = f" (Tier {f['tier']})" if f.get("tier") else ""
+        lines.append(f"### {label}{tier_tag}")
         lines.append(f"{f['description']}")
+        if f.get("source_quote"):
+            lines.append(f"> \"{f['source_quote']}\"")
+        if f.get("pest_category"):
+            lines.append(f"- 🐛 **Pest category:** {f['pest_category']}")
+        if f.get("hedge_language_note"):
+            lines.append(f"- ⚠️ **Hedge language check:** {f['hedge_language_note']}")
+        if f.get("regional_risk_note"):
+            lines.append(f"- 📍 **Regional risk:** {f['regional_risk_note']}")
+        if f.get("landlord_compliance_note"):
+            lines.append(f"- 🏠 **Landlord compliance:** {f['landlord_compliance_note']}")
         lines.append(f"- **If left 6–12 months:** {f['trajectory_6_12_months']}")
         lines.append(f"- **If left 3–5 years:** {f['trajectory_3_5_years']}")
         lines.append(f"- **Indicative cost:** {f['cost_estimate']}")
-        if f.get("source_page"):
-            lines.append(f"- **Report page:** {f['source_page']}")
+        photo_id = f.get("source_photo_id")
+        if photo_id and photo_id in image_registry:
+            lines.append(f"- **Report page:** {image_registry[photo_id]['page']}")
         lines.append("")
 
     lines += ["## Checklist Compliance Review", "", "| Item | Status | Notes |", "|---|---|---|"]
@@ -179,24 +246,48 @@ if st.button("Submit", type="primary"):
             st.stop()
 
         content = []
-        page_images = {}
+        image_registry = {}
+        photo_counter = 0
 
         for i, page in enumerate(doc):
             page_num = i + 1
-            if page.get_images(full=True):
-                pix = page.get_pixmap(matrix=fitz.Matrix(1.5, 1.5))
-                png_bytes = pix.tobytes("png")
-                page_images[page_num] = png_bytes
+            for img in page.get_images(full=True):
+                xref = img[0]
+                try:
+                    base_image = doc.extract_image(xref)
+                    width = base_image.get("width", 0)
+                    height = base_image.get("height", 0)
+                    if width < 150 or height < 150:
+                        continue  # skip tiny logos/icons, not real inspection photos
+                    pil_img = Image.open(io.BytesIO(base_image["image"])).convert("RGB")
+                    buf = io.BytesIO()
+                    pil_img.save(buf, format="PNG")
+                    png_bytes = buf.getvalue()
+                except Exception:
+                    continue
+
+                photo_counter += 1
+                photo_id = f"photo_{photo_counter}"
+                image_registry[photo_id] = {"bytes": png_bytes, "page": page_num}
+
                 b64 = base64.b64encode(png_bytes).decode("utf-8")
-                content.append({"type": "text", "text": f"Image below is page {page_num} of the report:"})
+                content.append({"type": "text", "text": f"{photo_id} (from report page {page_num}):"})
                 content.append({
                     "type": "image",
                     "source": {"type": "base64", "media_type": "image/png", "data": b64}
                 })
 
+        context_lines = []
+        if price:
+            context_lines.append(f"Asking/contract price: {price}")
+        if plan:
+            context_lines.append(f"Buyer's plan: {plan}")
+        context_text = "\n".join(context_lines) if context_lines else "None provided."
+
         content.insert(0, {
             "type": "text",
-            "text": f"CHECKLIST:\n{checklist_text}\n\nREPORT TEXT (page markers included):\n{full_text}"
+            "text": f"BUYER CONTEXT:\n{context_text}\n\nCHECKLIST:\n{checklist_text}\n\n"
+                    f"REPORT TEXT (page markers included):\n{full_text}"
         })
 
         with st.spinner("Reading your report, including photos..."):
@@ -206,22 +297,91 @@ if st.button("Submit", type="primary"):
                 system=(
                     "You are reviewing a building & pest inspection report for a home buyer. "
                     "You are not a licensed builder, pest inspector, or lawyer, and must not give "
-                    "legal, financial, or professional advice. You are given the report's text "
-                    "(with page number markers) and images of pages that contain photos — look at "
-                    "the photos when relevant to a finding.\n\n"
+                    "legal, financial, or professional advice, EXCEPT for the conditional verdict "
+                    "behavior described below, which only activates when a price is provided.\n\n"
+                    "You are given: buyer context (price and buyer's plan, if supplied), the "
+                    "checklist, the report's text (with page number markers), and individual "
+                    "labelled photos extracted from the report (each labelled photo_1, photo_2, "
+                    "etc, with the page it came from) — look at the photos when relevant.\n\n"
+                    "EXTRACTED PROPERTY DETAILS: Most compliant reports state the property's age/"
+                    "year built, construction type (e.g. brick veneer, weatherboard, double brick), "
+                    "roof type, and foundation type (slab, stumps, etc) as part of the inspection "
+                    "scope. Extract these directly from the report text into "
+                    "'extracted_property_details' so the reader doesn't have to type them in. If a "
+                    "detail genuinely isn't stated anywhere in the report, say so rather than "
+                    "guessing.\n\n"
+                    "CONDITIONAL VERDICT MODE: If a price was provided in the buyer context, "
+                    "populate the 'verdict' object with a recommendation (one of: 'proceed as is', "
+                    "'proceed with negotiation', 'specialist follow-up before deciding', 'walk away'), "
+                    "2-3 sentences of reasoning, and if negotiating, a specific dollar figure and how "
+                    "to justify it given the price and findings. Also populate each finding's 'tier' "
+                    "field: tier 1 = safety hazards, structural defects, active termites, or anything "
+                    "likely over ~$10k; tier 2 = roughly $2k-$10k or negotiation-relevant; tier 3 = "
+                    "minor/cosmetic. If no price was given, set 'verdict' to null and leave 'tier' "
+                    "null on every finding — do not give a verdict or dollar-tier grouping in that "
+                    "case, use severity only. Every reader gets the same findings, photos, costs, "
+                    "and trajectories regardless of price; price only unlocks the verdict and tier "
+                    "layer on top.\n\n"
+                    "HEDGE LANGUAGE: When a finding involves phrases like 'further investigation "
+                    "recommended' or 'outside the scope of this inspection', note in "
+                    "'hedge_language_note' whether this reads as generic liability boilerplate or a "
+                    "genuine signal worth following up, and briefly say what makes you read it that way. "
+                    "Null if not applicable.\n\n"
+                    "PEST CATEGORIZATION: For pest/timber-pest findings, classify 'pest_category' as "
+                    "one of: 'active termite activity', 'historical damage', 'conducive conditions', "
+                    "'evidence of prior treatment'. Each carries different risk and action. For borer "
+                    "findings, distinguish in the description whether it's lyctus (sapwood only, "
+                    "usually cosmetic) or anobium (can be structural in older pine floors). Leave "
+                    "pest_category null if the finding isn't pest-related.\n\n"
+                    "REGIONAL RISK: Infer the property's state from the report (address, inspector "
+                    "licensing body, etc). Where relevant, note in 'regional_risk_note' any applicable "
+                    "regional risk context: cyclone wind regions in northern QLD/WA, higher termite "
+                    "pressure in QLD and northern WA, restumping/reblocking risk in older VIC homes, "
+                    "salt damp in SA stone buildings, asbestos likelihood in anything built pre-1990. "
+                    "Null if not relevant to this finding.\n\n"
+                    "LANDLORD COMPLIANCE: For smoke alarms, balustrades, pool fencing, or similar items "
+                    "covered by state minimum rental standards, note in 'landlord_compliance_note' that "
+                    "this may carry a statutory compliance deadline or fine separate from ordinary "
+                    "repair cost, and recommend confirming current requirements for the relevant state. "
+                    "Null if not applicable.\n\n"
+                    "INSPECTOR QUESTIONS: Separately from top_3_actions, compile a fuller list in "
+                    "'inspector_questions' of every question genuinely worth a phone call to the "
+                    "inspector — contradictions in the report, ambiguous findings, anything the report "
+                    "hedges on.\n\n"
                     "Respond with ONLY a valid JSON object — no markdown, no code fences, no text "
                     "before or after — matching exactly this structure:\n"
                     "{\n"
                     '  "report_type_note": "one sentence noting what kind of report this is and any scope gap, or null",\n'
-                    '  "top_3_actions": ["...", "...", "..."],\n'
+                    '  "extracted_property_details": {"age_year_built": "... or null if not stated", '
+                    '"construction_type": "... or null", "roof_type": "... or null", '
+                    '"foundation_type": "... or null"},\n'
+                    '  "verdict": {"recommendation": "...", "reasoning": "...", "negotiation_amount": "... or null"} or null,\n'
+                    '  "top_3_actions": [\n'
+                    "    {\n"
+                    '      "action": "plain-language description of what to do or ask about",\n'
+                    '      "script": "an exact, copy-pasteable sentence the reader could literally say '
+                    'to the inspector, agent, or vendor to follow up on this"\n'
+                    "    }\n"
+                    "  ],\n"
+                    '  "inspector_questions": ["...", "..."],\n'
                     '  "findings": [\n'
                     "    {\n"
                     '      "description": "plain language description",\n'
+                    '      "source_quote": "the exact sentence or phrase from the report this finding is '
+                    'based on, quoted verbatim, or null if it is a general observation not tied to one '
+                    'specific line",\n'
                     '      "severity": "safety-critical | major | moderate | minor | gap",\n'
+                    '      "tier": "1 | 2 | 3, or null (see CONDITIONAL VERDICT MODE above)",\n'
+                    '      "pest_category": "active termite activity | historical damage | conducive '
+                    'conditions | evidence of prior treatment, or null",\n'
+                    '      "hedge_language_note": "... or null",\n'
+                    '      "regional_risk_note": "... or null",\n'
+                    '      "landlord_compliance_note": "... or null",\n'
                     '      "trajectory_6_12_months": "qualitative description",\n'
                     '      "trajectory_3_5_years": "qualitative description",\n'
                     '      "cost_estimate": "indicative AUD range, general estimate only",\n'
-                    '      "source_page": integer page number this finding relates to, or null\n'
+                    '      "source_photo_id": "the exact photo_N label that best illustrates this finding, '
+                    'or null if no specific photo applies"\n'
                     "    }\n"
                     "  ],\n"
                     '  "checklist_review": [\n'
@@ -229,10 +389,13 @@ if st.button("Submit", type="primary"):
                     "  ]\n"
                     "}\n\n"
                     "Only include ACTUAL findings, issues, or gaps in the findings array — never "
-                    "include a 'no issues found' statement as a finding. Never include an overall "
-                    "score or buy/don't-buy recommendation anywhere. When referencing technical "
-                    "standards, use plain language, not raw code numbers. Do not worry about "
-                    "ordering the findings array — that is handled separately."
+                    "include a 'no issues found' statement as a finding. If the report is genuinely "
+                    "thorough and clean, say so plainly in report_type_note or the findings — do not "
+                    "manufacture problems, gaps, or concerns that are not genuinely present just to "
+                    "have something to report. Outside of the conditional verdict mode described above, "
+                    "never include an overall score or buy/don't-buy recommendation anywhere. When "
+                    "referencing technical standards, use plain language, not raw code numbers. Do not "
+                    "worry about ordering the findings array — that is handled separately."
                 ),
                 messages=[{"role": "user", "content": content}]
             )
@@ -242,8 +405,7 @@ if st.button("Submit", type="primary"):
             if block.type == "text":
                 response_text += block.text
 
-        image_count = sum(1 for c in content if c.get("type") == "image")
-        st.caption(f"Debug — stop reason: {message.stop_reason} | tokens used: {message.usage.output_tokens} | images sent: {image_count}")
+        st.caption(f"Debug — stop reason: {message.stop_reason} | tokens used: {message.usage.output_tokens} | photos sent: {photo_counter}")
 
         try:
             data = json.loads(extract_json(response_text))
@@ -253,15 +415,58 @@ if st.button("Submit", type="primary"):
             st.write(response_text)
             st.stop()
 
-        severity_rank = {"safety-critical": 0, "major": 1, "moderate": 2, "minor": 3, "gap": 4}
-        data["findings"].sort(key=lambda f: severity_rank.get(f.get("severity", "gap"), 5))
+        if price:
+            tier_rank = {"1": 0, "2": 1, "3": 2}
+            data["findings"].sort(key=lambda f: tier_rank.get(str(f.get("tier")), 3))
+        else:
+            severity_rank = {"safety-critical": 0, "major": 1, "moderate": 2, "minor": 3, "gap": 4}
+            data["findings"].sort(key=lambda f: severity_rank.get(f.get("severity", "gap"), 5))
 
         if data.get("report_type_note"):
             st.info(data["report_type_note"])
 
+        extracted = data.get("extracted_property_details")
+        if extracted and any(extracted.values()):
+            detail_bits = []
+            if extracted.get("age_year_built"):
+                detail_bits.append(f"**Built:** {extracted['age_year_built']}")
+            if extracted.get("construction_type"):
+                detail_bits.append(f"**Construction:** {extracted['construction_type']}")
+            if extracted.get("roof_type"):
+                detail_bits.append(f"**Roof:** {extracted['roof_type']}")
+            if extracted.get("foundation_type"):
+                detail_bits.append(f"**Foundation:** {extracted['foundation_type']}")
+            if detail_bits:
+                st.markdown(
+                    '<div style="background-color:#F5F6F7;border-radius:12px;padding:12px 16px;'
+                    'margin-bottom:16px;">'
+                    '<span style="color:#6B7280;font-size:0.85em;">📐 Extracted from report — ' +
+                    " &nbsp;|&nbsp; ".join(detail_bits) +
+                    '</span></div>',
+                    unsafe_allow_html=True
+                )
+
+        verdict = data.get("verdict")
+        if verdict:
+            rec = verdict.get("recommendation", "")
+            color, label = VERDICT_STYLE.get(rec, ("#6B7280", rec.title()))
+            negotiation_html = (
+                f'<div style="margin-top:8px;"><b>Suggested negotiation figure:</b> '
+                f'{verdict.get("negotiation_amount")}</div>'
+                if verdict.get("negotiation_amount") else ""
+            )
+            st.markdown(
+                f'<div style="background-color:{color}15;border:2px solid {color};'
+                f'border-radius:12px;padding:16px;margin-bottom:16px;">'
+                f'<div style="font-size:1.3em;font-weight:700;color:{color};">{label}</div>'
+                f'<div style="margin-top:8px;">{verdict.get("reasoning","")}</div>'
+                f'{negotiation_html}</div>',
+                unsafe_allow_html=True
+            )
+
         st.download_button(
             label="⬇️ Download this review",
-            data=build_markdown_report(data),
+            data=build_markdown_report(data, image_registry),
             file_name=f"{uploaded_file.name.rsplit('.', 1)[0]}_review.md",
             mime="text/markdown",
             type="primary"
@@ -269,8 +474,18 @@ if st.button("Submit", type="primary"):
 
         st.markdown("## 🎯 Top 3 Priority Actions")
         with st.container(border=True):
-            for i, action in enumerate(data.get("top_3_actions", []), start=1):
+            for i, item in enumerate(data.get("top_3_actions", []), start=1):
+                action = item.get("action") if isinstance(item, dict) else item
+                script = item.get("script") if isinstance(item, dict) else None
                 st.markdown(f"**{i}.** {action}")
+                if script:
+                    st.markdown(f"> 💬 *Say this:* \"{script}\"")
+
+        if data.get("inspector_questions"):
+            st.markdown("## 📞 Questions to Ask Your Inspector")
+            with st.container(border=True):
+                for q in data["inspector_questions"]:
+                    st.markdown(f"- {q}")
 
         counts = {}
         for f in data["findings"]:
@@ -293,9 +508,10 @@ if st.button("Submit", type="primary"):
             with st.container(border=True):
                 img_col, text_col = st.columns([1, 2])
                 with img_col:
-                    src_page = f.get("source_page")
-                    if src_page and src_page in page_images:
-                        st.image(page_images[src_page], caption=f"Page {src_page}", use_container_width=True)
+                    photo_id = f.get("source_photo_id")
+                    if photo_id and photo_id in image_registry:
+                        entry = image_registry[photo_id]
+                        st.image(entry["bytes"], caption=f"Page {entry['page']}", use_container_width=True)
                     else:
                         st.markdown(
                             '<div style="background-color:#F5F6F7;border-radius:8px;padding:40px 10px;'
@@ -304,7 +520,19 @@ if st.button("Submit", type="primary"):
                         )
                 with text_col:
                     st.markdown(severity_badge(f["severity"]), unsafe_allow_html=True)
+                    if f.get("tier"):
+                        st.markdown(f"**Tier {f['tier']}**")
                     st.markdown(f"**{f['description']}**")
+                    if f.get("source_quote"):
+                        st.markdown(f"> *\"{f['source_quote']}\"*")
+                    if f.get("pest_category"):
+                        st.markdown(f"🐛 *Pest category: {f['pest_category']}*")
+                    if f.get("hedge_language_note"):
+                        st.markdown(f"⚠️ *Hedge language check: {f['hedge_language_note']}*")
+                    if f.get("regional_risk_note"):
+                        st.markdown(f"📍 *Regional risk: {f['regional_risk_note']}*")
+                    if f.get("landlord_compliance_note"):
+                        st.markdown(f"🏠 *Landlord compliance: {f['landlord_compliance_note']}*")
                     st.markdown(f"**If left 6–12 months:** {f['trajectory_6_12_months']}")
                     st.markdown(f"**If left 3–5 years:** {f['trajectory_3_5_years']}")
                     st.markdown(f"**Indicative cost:** {f['cost_estimate']}")
